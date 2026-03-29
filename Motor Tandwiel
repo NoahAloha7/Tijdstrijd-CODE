@@ -1,0 +1,40 @@
+#include <Stepper.h>
+
+const int stepsPerRevolution = 2048;   // 360 graden
+const int stepsPer120 = 682;           // 120 graden (2048 / 3)
+
+Stepper myStepper(stepsPerRevolution, 8, 10, 9, 11);
+
+const int knopLinks = 2;
+const int knopRechts = 4;
+
+bool vorigeLinksStatus = HIGH;
+bool vorigeRechtsStatus = HIGH;
+
+void setup() {
+  myStepper.setSpeed(10);   // Snelheid in RPM
+
+  pinMode(knopLinks, INPUT_PULLUP);
+  pinMode(knopRechts, INPUT_PULLUP);
+}
+
+void loop() {
+
+  bool huidigeLinksStatus = digitalRead(knopLinks);
+  bool huidigeRechtsStatus = digitalRead(knopRechts);
+
+  // ---- LINKER KNOP ----
+  if (vorigeLinksStatus == HIGH && huidigeLinksStatus == LOW) {
+    myStepper.step(-stepsPer120);   // 120 graden links
+  }
+
+  // ---- RECHTER KNOP ----
+  if (vorigeRechtsStatus == HIGH && huidigeRechtsStatus == LOW) {
+    myStepper.step(stepsPer120);    // 120 graden rechts
+  }
+
+  vorigeLinksStatus = huidigeLinksStatus;
+  vorigeRechtsStatus = huidigeRechtsStatus;
+
+  delay(50);   // kleine debounce
+}
