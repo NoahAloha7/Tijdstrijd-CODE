@@ -1,0 +1,228 @@
+/* ===================== KLOK ===================== */
+
+#include <MD_MAX72xx.h>
+#include <SPI.h>
+
+#define HARDWARE_TYPE MD_MAX72XX::FC16_HW
+#define DEVICES 4
+#define MATRIX_COLS (DEVICES * 8)
+
+MD_MAX72XX mxA = MD_MAX72XX(HARDWARE_TYPE, 8, 9, 10, DEVICES);
+MD_MAX72XX mxB = MD_MAX72XX(HARDWARE_TYPE, 11, 12, 13, DEVICES);
+
+#define BUTTON_MAIN 2
+
+#define A_PLUS 4
+#define A_MINUS 5
+
+#define B_PLUS 6
+#define B_MINUS 7
+
+#define BUZZER 3
+
+#define START_TIME 900   // 20 minutes
+
+unsigned long playerA = START_TIME;
+unsigned long playerB = START_TIME;
+
+bool playerATurn = true;
+bool clockRunning = false;
+bool paused = false;
+
+unsigned long lastTick;
+
+bool buttonPrev = HIGH;
+unsigned long pressStart = 0;
+
+bool blinkState = true;
+unsigned long lastBlink = 0;
+
+byte digits[10][8] = {
+  {B01110,B10001,B10011,B10101,B11001,B10001,B01110,B00000},
+  {B00100,B01100,B00100,B00100,B00100,B00100,B01110,B00000},
+  {B01110,B10001,B00001,B00010,B00100,B01000,B11111,B00000},
+  {B11110,B00001,B00001,B01110,B00001,B00001,B11110,B00000},
+  {B00010,B00110,B01010,B10010,B11111,B00010,B00010,B00000},
+  {B11111,B10000,B11110,B00001,B00001,B10001,B01110,B00000},
+  {B00110,B01000,B10000,B11110,B10001,B10001,B01110,B00000},
+  {B11111,B00001,B00010,B00100,B01000,B01000,B01000,B00000},
+  {B01110,B10001,B10001,B01110,B10001,B10001,B01110,B00000},
+  {B01110,B10001,B10001,B01111,B00001,B00010,B11100,B00000}
+};
+
+// Normal orientation
+void setPixelNormal(MD_MAX72XX &mx, int row, int col, bool state)
+{
+  int flippedRow = 7 - row;
+  mx.setPoint(flippedRow, col, state);
+}
+
+// Rotated 180 degrees
+void setPixelRotated(MD_MAX72XX &mx, int row, int col, bool state)
+{
+  int rotatedCol = MATRIX_COLS - 1 - col;
+  mx.setPoint(row, rotatedCol, state);
+}
+
+void drawDigit(MD_MAX72XX &mx, int digit, int module, bool rotated = false)
+{
+  int offset = module * 8 + 1;
+
+  for (int row = 0; row < 8; row++)
+  {
+    byte line = digits[digit][row];
+
+    for (int col = 0; col < 5; col++)
+    {
+      bool pixel = bitRead(line, 4 - col);
+
+      if (rotated)
+        setPixelRotated(mx, row, offset + col, pixel);
+      else
+        setPixelNormal(mx, row, offset + col, pixel);
+    }
+  }
+}
+
+void drawColon(MD_MAX72XX &mx, bool rotated = false)
+{
+  if (rotated)
+  {
+    setPixelRotated(mx, 2, 15, true);
+    setPixelRotated(mx, 5, 15, true);
+  }
+  else
+  {
+    setPixelNormal(mx, 2, 15, true);
+    setPixelNormal(mx, 5, 15, true);
+  }
+}
+
+void drawTime(MD_MAX72XX &mx, int seconds, bool rotated = false)
+{
+  int minutes = seconds / 60;
+  int secs = seconds % 60;
+
+  int d1 = minutes / 10;
+  int d2 = minutes % 10;
+  int d3 = secs / 10;
+  int d4 = secs % 10;
+
+  mx.clear();
+
+  drawDigit(mx, d1, 0, rotated);
+  drawDigit(mx, d2, 1, rotated);
+  drawColon(mx, rotated);
+  drawDigit(mx, d3, 2, rotated);
+  drawDigit(mx, d4, 3, rotated);
+
+  mx.update();
+}
+
+void adjustTimer(unsigned long &timer, int amount)
+{
+  long t = timer + amount;
+
+  if (t < 0) t = 0;
+  if (t > 5999) t = 5999;
+
+  timer = t;
+}
+
+void setup()
+{
+  mxA.begin();
+  mxB.begin();
+
+  mxA.control(MD_MAX72XX::UPDATE, MD_MAX72XX::OFF);
+  mxB.control(MD_MAX72XX::UPDATE, MD_MAX72XX::OFF);
+
+  pinMode(BUTTON_MAIN, INPUT_PULLUP);
+
+  pinMode(A_PLUS, INPUT_PULLUP);
+  pinMode(A_MINUS, INPUT_PULLUP);
+
+  pinMode(B_PLUS, INPUT_PULLUP);
+  pinMode(B_MINUS, INPUT_PULLUP);
+
+  pinMode(BUZZER, OUTPUT);
+}
+
+void loop()
+{
+  if (millis() - lastBlink >= 500)
+  {
+    lastBlink = millis();
+    blinkState = !blinkState;
+  }
+
+  bool button = digitalRead(BUTTON_MAIN);
+
+  if (button == LOW && buttonPrev == HIGH)
+    pressStart = millis();
+
+  if (button == HIGH && buttonPrev == LOW)
+  {
+    unsigned long pressLength = millis() - pressStart;
+
+    if (pressLength >= 2000)
+      paused = !paused;
+    else
+    {
+      if (!clockRunning)
+        clockRunning = true;
+      else if (!paused)
+        playerATurn = !playerATurn;
+    }
+  }
+
+  buttonPrev = button;
+
+  if (clockRunning && !paused && millis() - lastTick >= 1000)
+  {
+    lastTick = millis();
+
+    if (playerATurn && playerA > 0) playerA--;
+    if (!playerATurn && playerB > 0) playerB--;
+  }
+
+  if (digitalRead(A_PLUS) == LOW)  { adjustTimer(playerA, 30);  delay(200); }
+  if (digitalRead(A_MINUS) == LOW) { adjustTimer(playerA, -30); delay(200); }
+
+  if (digitalRead(B_PLUS) == LOW)  { adjustTimer(playerB, 30);  delay(200); }
+  if (digitalRead(B_MINUS) == LOW) { adjustTimer(playerB, -30); delay(200); }
+
+  // mxA on pins 8,9,10 is rotated
+  if (playerA == 0)
+  {
+    if (blinkState) drawTime(mxA, 0, true);
+    else mxA.clear();
+  }
+  else
+  {
+    drawTime(mxA, playerA, true);
+  }
+
+  // mxB on pins 11,12,13 is normal
+  if (playerB == 0)
+  {
+    if (blinkState) drawTime(mxB, 0, false);
+    else mxB.clear();
+  }
+  else
+  {
+    drawTime(mxB, playerB, false);
+  }
+
+  if (playerA == 0 || playerB == 0)
+  {
+    if (blinkState)
+      tone(BUZZER, 1000);
+    else
+      noTone(BUZZER);
+  }
+  else
+  {
+    noTone(BUZZER);
+  }
+}
