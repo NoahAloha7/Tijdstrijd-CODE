@@ -1,0 +1,1049 @@
+/* ===================== BLAUW ===================== */
+
+#include <Arduino.h>
+#include <LedControl.h>
+#include <avr/pgmspace.h>
+#include <string.h>
+
+/* ===================== Shared helpers ===================== */
+
+void printConfigAndHalt(const char* msg) {
+  Serial.println();
+  Serial.print("CONFIG ERROR: ");
+  Serial.println(msg);
+  Serial.println("Fix wiring or constants and re-upload.");
+  while (true) delay(1000);
+}
+
+/* ===================== Pair-check + Simon ===================== */
+
+// Pair-check wiring
+const int8_t PIN_SHIFT = -2;
+const uint8_t BASE_PINS[] = {30,31,32,33,34,35,36,37,38,39};
+const uint8_t NUM_PINS = sizeof(BASE_PINS) / sizeof(BASE_PINS[0]);
+const int8_t ORIGINAL_LED_PIN = 29;
+const bool LED_ACTIVE_HIGH = true;
+const uint8_t BUZZER_PIN = 8;
+const unsigned long SCAN_INTERVAL_MS = 120;
+const unsigned long LED_STABLE_MS = 180;
+
+// Simon wiring
+const uint8_t SIMON_BTN_PINS[4] = {40,42,44,46};
+const uint8_t SIMON_LED_PINS[4] = {41,43,45,47};
+const uint8_t LIGHT_TO_BUTTON_IDX[4] = {2,1,3,0};
+const uint8_t SIMON_ROUNDS = 5;
+const unsigned long SIMON_LED_ON_MS = 700;
+const unsigned long SIMON_STEP_GAP_MS = 160;
+const unsigned long SIMON_PRESS_FLASH_MS = 120;
+const unsigned long SIMON_INTERROUND_PAUSE_MS = 300;
+const unsigned long SIMON_RESET_PAUSE_MS = 350;
+const unsigned long SIMON_WRONG_ON_MS = 300;
+const unsigned long SIMON_WRONG_OFF_MS = 200;
+const uint8_t SIMON_SOLVED_LED_PIN = 26;
+const bool SIMON_SOLVED_LED_ACTIVE_HIGH = true;
+
+uint8_t pinsMonitored[NUM_PINS];
+const char* LOGICAL_COLOR_NAMES[NUM_PINS] = {
+  "BLUE","WHITE","GREEN","GREY","YELLOW","BROWN","ORANGE","BLACK","RED","PURPLE"
+};
+int8_t expectedPartner[NUM_PINS] = {1,0,3,2,5,4,7,6,9,8};
+int8_t lastPartner[NUM_PINS];
+
+int computedLedPin = -1;
+bool lastSemanticLedState = false;
+unsigned long ledTargetStableSince = 0;
+
+int simonSequence[SIMON_ROUNDS];
+uint8_t currentRound = 1;
+bool simonSolved = false;
+unsigned long lastPairScan = 0;
+
+const uint8_t SIMON_STATE_PLAY_ON = 0;
+const uint8_t SIMON_STATE_PLAY_GAP = 1;
+const uint8_t SIMON_STATE_INPUT = 2;
+const uint8_t SIMON_STATE_INTERROUND_PAUSE = 3;
+const uint8_t SIMON_STATE_WRONG_ON = 4;
+const uint8_t SIMON_STATE_WRONG_OFF = 5;
+const uint8_t SIMON_STATE_RESET_PAUSE = 6;
+const uint8_t SIMON_STATE_SOLVED = 7;
+
+uint8_t simonState = SIMON_STATE_PLAY_ON;
+uint8_t simonStepIndex = 0;
+uint8_t simonInputIndex = 0;
+uint8_t simonWrongCycles = 0;
+unsigned long simonStateStartedAt = 0;
+
+bool simonLedFlashSavedState[4] = {false,false,false,false};
+unsigned long simonLedFlashUntil[4] = {0,0,0,0};
+
+bool buzzerOn = false;
+unsigned long buzzerOffAt = 0;
+
+void requestBeep(unsigned long ms) {
+  if (BUZZER_PIN == 255) return;
+  unsigned long now = millis();
+  if (!buzzerOn) {
+    tone(BUZZER_PIN, 2000);
+    buzzerOn = true;
+  }
+  unsigned long offAt = now + ms;
+  if (offAt > buzzerOffAt) buzzerOffAt = offAt;
+}
+
+void updateBuzzer() {
+  if (BUZZER_PIN == 255) return;
+  if (buzzerOn && millis() >= buzzerOffAt) {
+    noTone(BUZZER_PIN);
+    buzzerOn = false;
+  }
+}
+
+void setSimonSolvedLed(bool on) {
+  if (SIMON_SOLVED_LED_ACTIVE_HIGH) digitalWrite(SIMON_SOLVED_LED_PIN, on ? HIGH : LOW);
+  else digitalWrite(SIMON_SOLVED_LED_PIN, on ? LOW : HIGH);
+}
+
+void setupNormalDriving() {
+  for (uint8_t i = 0; i < NUM_PINS; i++) {
+    pinMode(pinsMonitored[i], OUTPUT);
+    digitalWrite(pinsMonitored[i], LOW);
+  }
+}
+
+void updateLedDebounced(bool semanticOn) {
+  unsigned long now = millis();
+  if (semanticOn != lastSemanticLedState) {
+    lastSemanticLedState = semanticOn;
+    ledTargetStableSince = now;
+  }
+  if (now - ledTargetStableSince >= LED_STABLE_MS) {
+    if (LED_ACTIVE_HIGH) digitalWrite(computedLedPin, semanticOn ? HIGH : LOW);
+    else digitalWrite(computedLedPin, semanticOn ? LOW : HIGH);
+  }
+}
+
+bool allPairsCorrect(const int8_t mapping[]) {
+  for (uint8_t i = 0; i < NUM_PINS; i++) {
+    int8_t p = mapping[i];
+    if (p < 0) return false;
+    if (mapping[p] != (int8_t)i) return false;
+    if (expectedPartner[i] != p) return false;
+  }
+  return true;
+}
+
+void printMapping(const int8_t mapping[]) {
+  Serial.println("Pair-check mapping:");
+  for (uint8_t i = 0; i < NUM_PINS; i++) {
+    Serial.print(" pin "); Serial.print(pinsMonitored[i]);
+    Serial.print(" ("); Serial.print(LOGICAL_COLOR_NAMES[i]); Serial.print(") -> ");
+    if (mapping[i] == -1) Serial.println("NONE");
+    else if (mapping[i] == -2) Serial.println("AMBIGUOUS");
+    else {
+      Serial.print(pinsMonitored[mapping[i]]);
+      Serial.print(" ("); Serial.print(LOGICAL_COLOR_NAMES[mapping[i]]); Serial.println(")");
+    }
+  }
+}
+
+void performPairScan(int8_t mapping[], bool printAmbig = false) {
+  for (uint8_t i = 0; i < NUM_PINS; i++) pinMode(pinsMonitored[i], INPUT_PULLUP);
+  delay(2);
+  for (uint8_t i = 0; i < NUM_PINS; i++) {
+    pinMode(pinsMonitored[i], OUTPUT);
+    digitalWrite(pinsMonitored[i], LOW);
+    delayMicroseconds(300);
+
+    int foundCount = 0;
+    int foundIndex = -1;
+    int foundList[NUM_PINS];
+    int foundCt = 0;
+
+    for (uint8_t j = 0; j < NUM_PINS; j++) {
+      if (j == i) continue;
+      if (digitalRead(pinsMonitored[j]) == LOW) {
+        foundList[foundCt++] = j;
+        foundCount++;
+        if (foundIndex == -1) foundIndex = j;
+      }
+    }
+
+    if (foundCount == 0) mapping[i] = -1;
+    else if (foundCount == 1) mapping[i] = foundIndex;
+    else mapping[i] = -2;
+
+    if (mapping[i] == -2 && printAmbig) {
+      Serial.print("Driver pin "); Serial.print(pinsMonitored[i]);
+      Serial.print(" saw multiple LOWs: ");
+      for (int k = 0; k < foundCt; k++) {
+        Serial.print(pinsMonitored[foundList[k]]);
+        if (k < foundCt - 1) Serial.print(", ");
+      }
+      Serial.println();
+    }
+
+    pinMode(pinsMonitored[i], INPUT_PULLUP);
+    delayMicroseconds(40);
+  }
+  setupNormalDriving();
+}
+
+void handlePairScanResult(const int8_t mapping[]) {
+  for (uint8_t i = 0; i < NUM_PINS; i++) {
+    int8_t m = mapping[i];
+    int8_t prev = lastPartner[i];
+    if (m != prev) {
+      if (prev >= 0) {
+        if (i < (uint8_t)prev) {
+          bool prevWasCorrect = (expectedPartner[i] == prev && mapping[prev] == (int8_t)i);
+          Serial.print("Removed: "); Serial.print(LOGICAL_COLOR_NAMES[i]);
+          Serial.print(" (pin "); Serial.print(pinsMonitored[i]); Serial.print(") <-> ");
+          Serial.print(LOGICAL_COLOR_NAMES[prev]); Serial.print(" (pin "); Serial.print(pinsMonitored[prev]); Serial.print(")");
+          Serial.print(" --- previously "); Serial.println(prevWasCorrect ? "CORRECT" : "WRONG");
+        }
+        requestBeep(30);
+      } else if (prev == -2) {
+        Serial.print("Ambiguity cleared for ");
+        Serial.print(LOGICAL_COLOR_NAMES[i]); Serial.print(" (pin "); Serial.print(pinsMonitored[i]); Serial.println(")");
+      }
+
+      if (m >= 0 && i < (uint8_t)m) {
+        bool mutual = (mapping[m] == (int8_t)i);
+        bool correct = mutual && (expectedPartner[i] == m);
+        Serial.print("Connected: "); Serial.print(LOGICAL_COLOR_NAMES[i]);
+        Serial.print(" (pin "); Serial.print(pinsMonitored[i]); Serial.print(") <-> ");
+        Serial.print(LOGICAL_COLOR_NAMES[m]); Serial.print(" (pin "); Serial.print(pinsMonitored[m]); Serial.print(") --- ");
+        Serial.println(correct ? "CORRECT" : "WRONG");
+        requestBeep(80);
+      } else if (m == -2) {
+        Serial.print("Ambiguous connection for ");
+        Serial.print(LOGICAL_COLOR_NAMES[i]); Serial.print(" (pin "); Serial.print(pinsMonitored[i]); Serial.println(") -> multiple pins tied");
+        requestBeep(2);
+      }
+
+      lastPartner[i] = m;
+    }
+  }
+
+  bool ok = true;
+  for (uint8_t i = 0; i < NUM_PINS; i++) {
+    int8_t p = mapping[i];
+    if (p < 0) { ok = false; break; }
+    if (mapping[p] != (int8_t)i) { ok = false; break; }
+    if (expectedPartner[i] != p) { ok = false; break; }
+  }
+  updateLedDebounced(ok);
+}
+
+/* Simon helpers */
+
+void simonAllLeds(bool on) {
+  for (uint8_t i = 0; i < 4; i++) digitalWrite(SIMON_LED_PINS[i], on ? HIGH : LOW);
+}
+
+void simonFlashButtonLed(uint8_t idx, unsigned long ms) {
+  if (idx >= 4) return;
+  simonLedFlashSavedState[idx] = (digitalRead(SIMON_LED_PINS[idx]) == HIGH);
+  digitalWrite(SIMON_LED_PINS[idx], HIGH);
+  simonLedFlashUntil[idx] = millis() + ms;
+}
+
+void updateSimonButtonFlashes(unsigned long now) {
+  for (uint8_t i = 0; i < 4; i++) {
+    if (simonLedFlashUntil[i] != 0 && now >= simonLedFlashUntil[i]) {
+      digitalWrite(SIMON_LED_PINS[i], simonLedFlashSavedState[i] ? HIGH : LOW);
+      simonLedFlashUntil[i] = 0;
+    }
+  }
+}
+
+void simonGenerateSequence() {
+  for (uint8_t i = 0; i < SIMON_ROUNDS; i++) simonSequence[i] = random(0, 4);
+}
+
+void simonGenerateSequenceAndAnnounce() {
+  simonGenerateSequence();
+  Serial.println("Simon: new sequence generated.");
+}
+
+void simonStartRound(uint8_t roundLen, unsigned long now) {
+  simonState = SIMON_STATE_PLAY_ON;
+  simonStepIndex = 0;
+  simonInputIndex = 0;
+  simonWrongCycles = 0;
+  simonStateStartedAt = now;
+  simonAllLeds(false);
+  Serial.print("Simon: round "); Serial.print(roundLen); Serial.println(" start");
+}
+
+void simonStartSolved() {
+  // Cancel any pending flash restores so the final button stays on
+  for (uint8_t i = 0; i < 4; i++) {
+    simonLedFlashUntil[i] = 0;
+    simonLedFlashSavedState[i] = true;
+  }
+
+  simonState = SIMON_STATE_SOLVED;
+  simonSolved = true;
+  simonAllLeds(true);
+  setSimonSolvedLed(true);
+  Serial.println("Simon: PUZZLE SOLVED - all Simon LEDs ON, solve LED ON");
+}
+
+void simonBeginWrongFeedback(unsigned long now) {
+  simonState = SIMON_STATE_WRONG_ON;
+  simonWrongCycles = 0;
+  simonStateStartedAt = now;
+  simonAllLeds(true);
+  Serial.println("Simon: WRONG — resetting sequence");
+}
+
+void simonCompleteRound(unsigned long now) {
+  // Do not force LEDs off here; let the last button flash finish naturally.
+  simonInputIndex = 0;
+  simonStepIndex = 0;
+
+  if (currentRound >= SIMON_ROUNDS) {
+    simonStartSolved();
+  } else {
+    currentRound++;
+    simonState = SIMON_STATE_INTERROUND_PAUSE;
+    simonStateStartedAt = now;
+    Serial.print("Simon: round "); Serial.print(currentRound - 1); Serial.println(" complete!");
+  }
+}
+
+void simonResetAfterWrong(unsigned long now) {
+  simonAllLeds(false);
+  simonGenerateSequenceAndAnnounce();
+  currentRound = 1;
+  simonInputIndex = 0;
+  simonStepIndex = 0;
+  simonState = SIMON_STATE_RESET_PAUSE;
+  simonStateStartedAt = now;
+  setSimonSolvedLed(false);
+}
+
+bool simonProcessButtonPress(uint8_t btn, unsigned long now) {
+  if (simonSolved) return true;
+  if (simonState == SIMON_STATE_INTERROUND_PAUSE ||
+      simonState == SIMON_STATE_RESET_PAUSE ||
+      simonState == SIMON_STATE_WRONG_ON ||
+      simonState == SIMON_STATE_WRONG_OFF) {
+    return true;
+  }
+
+  simonFlashButtonLed(btn, SIMON_PRESS_FLASH_MS);
+
+  if (simonInputIndex >= currentRound) return true;
+
+  uint8_t expectedBtn = LIGHT_TO_BUTTON_IDX[simonSequence[simonInputIndex]];
+  if (btn != expectedBtn) {
+    simonBeginWrongFeedback(now);
+    return false;
+  }
+
+  simonInputIndex++;
+  if (simonInputIndex == currentRound) {
+    simonCompleteRound(now);
+  }
+  return true;
+}
+
+void simonPollButtons(unsigned long now) {
+  static int lastState[4] = {HIGH, HIGH, HIGH, HIGH};
+  static unsigned long lastChange[4] = {0,0,0,0};
+  static bool latched[4] = {false,false,false,false};
+
+  for (uint8_t i = 0; i < 4; i++) {
+    int s = digitalRead(SIMON_BTN_PINS[i]);
+    if (s != lastState[i]) {
+      lastState[i] = s;
+      lastChange[i] = now;
+    } else {
+      if (s == LOW && !latched[i] && (now - lastChange[i] >= 12)) {
+        latched[i] = true;
+        simonProcessButtonPress(i, now);
+      } else if (s == HIGH) {
+        latched[i] = false;
+      }
+    }
+  }
+}
+
+void simonUpdate(unsigned long now) {
+  if (simonSolved) {
+    setSimonSolvedLed(true);
+    return;
+  }
+
+  if (simonState == SIMON_STATE_INTERROUND_PAUSE) {
+    if (now - simonStateStartedAt >= SIMON_INTERROUND_PAUSE_MS) {
+      simonStartRound(currentRound, now);
+    }
+    return;
+  }
+
+  if (simonState == SIMON_STATE_RESET_PAUSE) {
+    if (now - simonStateStartedAt >= SIMON_RESET_PAUSE_MS) {
+      simonStartRound(currentRound, now);
+    }
+    return;
+  }
+
+  if (simonState == SIMON_STATE_WRONG_ON) {
+    if (now - simonStateStartedAt >= SIMON_WRONG_ON_MS) {
+      simonAllLeds(false);
+      simonState = SIMON_STATE_WRONG_OFF;
+      simonStateStartedAt = now;
+    }
+    return;
+  }
+
+  if (simonState == SIMON_STATE_WRONG_OFF) {
+    if (now - simonStateStartedAt >= SIMON_WRONG_OFF_MS) {
+      simonWrongCycles++;
+      if (simonWrongCycles >= 2) {
+        simonResetAfterWrong(now);
+      } else {
+        simonAllLeds(true);
+        simonState = SIMON_STATE_WRONG_ON;
+        simonStateStartedAt = now;
+      }
+    }
+    return;
+  }
+
+  if (simonInputIndex >= currentRound) {
+    simonCompleteRound(now);
+    return;
+  }
+
+  if (simonState == SIMON_STATE_PLAY_ON) {
+    if (simonStepIndex < currentRound) {
+      uint8_t ledIdx = simonSequence[simonStepIndex];
+      digitalWrite(SIMON_LED_PINS[ledIdx], HIGH);
+      if (now - simonStateStartedAt >= SIMON_LED_ON_MS) {
+        digitalWrite(SIMON_LED_PINS[ledIdx], LOW);
+        simonState = SIMON_STATE_PLAY_GAP;
+        simonStateStartedAt = now;
+      }
+    } else {
+      simonState = SIMON_STATE_INPUT;
+      simonStateStartedAt = now;
+      simonAllLeds(false);
+    }
+    return;
+  }
+
+  if (simonState == SIMON_STATE_PLAY_GAP) {
+    if (now - simonStateStartedAt >= SIMON_STEP_GAP_MS) {
+      simonStepIndex++;
+      if (simonStepIndex >= currentRound) {
+        simonState = SIMON_STATE_INPUT;
+        simonAllLeds(false);
+        simonStateStartedAt = now;
+      } else {
+        simonState = SIMON_STATE_PLAY_ON;
+        simonStateStartedAt = now;
+      }
+    }
+    return;
+  }
+
+  // SIMON_STATE_INPUT: waiting for presses
+}
+
+void initPairSimon() {
+  for (uint8_t i = 0; i < NUM_PINS; i++) {
+    int computed = (int)BASE_PINS[i] + (int)PIN_SHIFT;
+    if (computed < 0 || computed > 63) printConfigAndHalt("PIN_SHIFT result out of range");
+    pinsMonitored[i] = (uint8_t)computed;
+  }
+
+  int computedLed = (int)ORIGINAL_LED_PIN + (int)PIN_SHIFT;
+  if (computedLed < 0 || computedLed > 63) printConfigAndHalt("Computed LED pin out of range");
+  computedLedPin = computedLed;
+
+  for (uint8_t i = 0; i < NUM_PINS; i++) {
+    if (pinsMonitored[i] == (uint8_t)computedLedPin) printConfigAndHalt("Pair-check LED pin collides with monitored pins");
+  }
+
+  for (uint8_t s = 0; s < 4; s++) {
+    for (uint8_t i = 0; i < NUM_PINS; i++) {
+      if (pinsMonitored[i] == SIMON_BTN_PINS[s] || pinsMonitored[i] == SIMON_LED_PINS[s]) {
+        Serial.print("CONFIG ERROR: Simon pin collides with pair-check pin: ");
+        Serial.println(pinsMonitored[i]);
+        printConfigAndHalt("Simon pin collision");
+      }
+    }
+    if (SIMON_BTN_PINS[s] == (uint8_t)computedLedPin || SIMON_LED_PINS[s] == (uint8_t)computedLedPin) {
+      Serial.print("CONFIG ERROR: Simon pin collides with pair-check LED pin: ");
+      Serial.println(computedLedPin);
+      printConfigAndHalt("Simon pin collision with pair-check LED");
+    }
+  }
+
+  if ((uint8_t)computedLedPin == SIMON_SOLVED_LED_PIN) printConfigAndHalt("Solve LED collides with pair-check LED");
+  for (uint8_t i = 0; i < NUM_PINS; i++) if (pinsMonitored[i] == SIMON_SOLVED_LED_PIN) printConfigAndHalt("Solve LED collides with pair-check monitored pin");
+  for (uint8_t s = 0; s < 4; s++) if (SIMON_BTN_PINS[s] == SIMON_SOLVED_LED_PIN || SIMON_LED_PINS[s] == SIMON_SOLVED_LED_PIN) printConfigAndHalt("Solve LED collides with Simon pin");
+
+  for (uint8_t i = 0; i < NUM_PINS; i++) lastPartner[i] = -1;
+  setupNormalDriving();
+
+  pinMode(computedLedPin, OUTPUT);
+  digitalWrite(computedLedPin, LED_ACTIVE_HIGH ? LOW : HIGH);
+  lastSemanticLedState = false;
+  ledTargetStableSince = millis();
+
+  if (BUZZER_PIN != 255) pinMode(BUZZER_PIN, OUTPUT);
+
+  for (uint8_t i = 0; i < 4; i++) {
+    pinMode(SIMON_BTN_PINS[i], INPUT_PULLUP);
+    pinMode(SIMON_LED_PINS[i], OUTPUT);
+    digitalWrite(SIMON_LED_PINS[i], LOW);
+  }
+
+  pinMode(SIMON_SOLVED_LED_PIN, OUTPUT);
+  digitalWrite(SIMON_SOLVED_LED_PIN, SIMON_SOLVED_LED_ACTIVE_HIGH ? LOW : HIGH);
+
+  randomSeed(analogRead(A0) ^ micros());
+  simonGenerateSequenceAndAnnounce();
+  currentRound = 1;
+  simonSolved = false;
+  simonState = SIMON_STATE_PLAY_ON;
+  simonStepIndex = 0;
+  simonInputIndex = 0;
+  simonWrongCycles = 0;
+  simonStateStartedAt = millis();
+  simonAllLeds(false);
+  setSimonSolvedLed(false);
+
+  Serial.println("System ready.");
+  Serial.print("PIN_SHIFT = "); Serial.println(PIN_SHIFT);
+  Serial.print("Pair-check LED pin (computed) = "); Serial.println(computedLedPin);
+  Serial.print("Simon solved LED pin = "); Serial.println(SIMON_SOLVED_LED_PIN);
+  Serial.println("Type 'm' to print pair-check mapping.");
+}
+
+void pollPairSimon() {
+  if (Serial.available()) {
+    char c = Serial.read();
+    if (c == 'm' || c == 'M') {
+      int8_t mapping[NUM_PINS];
+      performPairScan(mapping, true);
+      printMapping(mapping);
+      Serial.print("All pairs correct? "); Serial.println(allPairsCorrect(mapping) ? "YES" : "NO");
+    }
+  }
+
+  unsigned long now = millis();
+
+  if (now - lastPairScan >= SCAN_INTERVAL_MS) {
+    int8_t mapping[NUM_PINS];
+    performPairScan(mapping, false);
+    handlePairScanResult(mapping);
+    lastPairScan = now;
+  }
+
+  updateSimonButtonFlashes(now);
+  simonPollButtons(now);
+  simonUpdate(now);
+}
+
+/* ===================== Encoder puzzle ===================== */
+
+const int pinA = A1;
+const int pinB = A2;
+const int pinBtn = A0;
+const int encoderLedPin = 39;
+
+volatile long encoderSteps = 0;
+const int countsPerDetent = 4;
+
+const int8_t transTable[16] = {
+  0,  1, -1,  0,
+ -1,  0,  0,  1,
+  1,  0,  0, -1,
+  0, -1,  1,  0
+};
+
+uint8_t lastAB;
+unsigned long lastEncMicros = 0;
+const unsigned long encDebounceUs = 900;
+
+int lastBtnState = HIGH;
+unsigned long lastBtnMillis = 0;
+const unsigned long btnDebounceMs = 50;
+bool btnLockedUntilRelease = false;
+
+const int requiredSelections = 4;
+int secretSequence[requiredSelections] = {4, 6, 5, 0};
+int currentIndex = 0;
+int lastPrintedPos = -1;
+
+const char* symbols[8] = {"TL","TM-L","TM-R","TR","BR","BM-R","BM-L","BL"};
+
+const int sectionForPosition[20] = {
+   0,0,0,
+   1,1,
+   2,2,
+   3,3,3,
+   4,4,4,
+   5,5,
+   6,6,
+   7,7,7
+};
+
+int computePositionFromSteps() {
+  long detents = encoderSteps / countsPerDetent;
+  return (int)((detents % 20 + 20) % 20);
+}
+
+int getSectionFromPosition(int position) {
+  return sectionForPosition[position];
+}
+
+void registerSelection(int section) {
+  Serial.print("Input: ");
+  Serial.print(section);
+  Serial.print(" (");
+  Serial.print(symbols[section]);
+  Serial.println(")");
+
+  if (section == secretSequence[currentIndex]) {
+    currentIndex++;
+    Serial.print("Progress: ");
+    Serial.print(currentIndex);
+    Serial.print("/");
+    Serial.println(requiredSelections);
+
+    if (currentIndex == requiredSelections) {
+      Serial.println("***** SOLVED *****");
+      digitalWrite(encoderLedPin, HIGH);
+      currentIndex = 0;
+    }
+  } else {
+    Serial.println("Mismatch -> resetting");
+    if (section == secretSequence[0]) {
+      currentIndex = 1;
+      Serial.println("Restarting from step 1");
+    } else {
+      currentIndex = 0;
+    }
+  }
+}
+
+void readEncoderPoll() {
+  uint8_t A = (digitalRead(pinA) == HIGH);
+  uint8_t B = (digitalRead(pinB) == HIGH);
+  uint8_t newAB = (A << 1) | B;
+
+  if (newAB != lastAB) {
+    unsigned long now = micros();
+    if ((now - lastEncMicros) >= encDebounceUs) {
+      int idx = (lastAB << 2) | newAB;
+      int8_t delta = transTable[idx];
+      if (delta != 0) {
+        encoderSteps += delta;
+        int pos = computePositionFromSteps();
+        if (pos != lastPrintedPos) {
+          int sec = getSectionFromPosition(pos);
+          Serial.print("Pos=");
+          Serial.print(pos);
+          Serial.print(" -> Sec=");
+          Serial.print(sec);
+          Serial.print(" (");
+          Serial.print(symbols[sec]);
+          Serial.println(")");
+          lastPrintedPos = pos;
+        }
+      }
+      lastEncMicros = now;
+    }
+    lastAB = newAB;
+  }
+}
+
+void readButtonPoll() {
+  int btnState = digitalRead(pinBtn);
+
+  if (btnState != lastBtnState) {
+    lastBtnMillis = millis();
+    lastBtnState = btnState;
+  } else {
+    if (btnState == LOW && !btnLockedUntilRelease) {
+      if (millis() - lastBtnMillis > btnDebounceMs) {
+        int pos = computePositionFromSteps();
+        int sec = getSectionFromPosition(pos);
+        registerSelection(sec);
+        btnLockedUntilRelease = true;
+      }
+    } else if (btnState == HIGH) {
+      btnLockedUntilRelease = false;
+    }
+  }
+}
+
+void initEncoderPuzzle() {
+  pinMode(pinA, INPUT_PULLUP);
+  pinMode(pinB, INPUT_PULLUP);
+  pinMode(pinBtn, INPUT_PULLUP);
+  pinMode(encoderLedPin, OUTPUT);
+
+  uint8_t A = (digitalRead(pinA) == HIGH);
+  uint8_t B = (digitalRead(pinB) == HIGH);
+  lastAB = (A << 1) | B;
+  lastEncMicros = micros();
+
+  Serial.println("=== Encoder puzzle (FINAL) ===");
+}
+
+void pollEncoderPuzzle() {
+  readEncoderPoll();
+  readButtonPoll();
+}
+
+/* ===================== Matrix + Joystick + Morse + Word ===================== */
+
+const int MX_DIN = A7;
+const int MX_CLK = A5;
+const int MX_CS  = A6;
+const int NUM_DEVICES = 4;
+LedControl lc = LedControl(MX_DIN, MX_CLK, MX_CS, NUM_DEVICES);
+const bool rotateMatrix180 = true;
+
+const int JOY_X = A15;
+const int JOY_Y = A14;
+const int JOY_CENTER_X = 512;
+const int JOY_CENTER_Y = 512;
+const int DEADZONE = 120;
+unsigned long lastJoyTime = 0;
+const int JOY_DELAY = 180;
+const int JOY_NONE = 0;
+const int JOY_LEFT = 1;
+const int JOY_RIGHT = 2;
+const int JOY_UP = 3;
+const int JOY_DOWN = 4;
+int lastDir = JOY_NONE;
+
+enum AxisLock { AXIS_NONE, AXIS_HORIZONTAL, AXIS_VERTICAL };
+AxisLock axisLock = AXIS_NONE;
+
+int morseLeds[4] = {48,49,50,51};
+int morseButtons[4] = {22,23,24,25};
+int correctSequence[4] = {2,1,3,1};
+int userSequence[4] = {0,0,0,0};
+int morseBufPos = 0;
+int morseTotal = 0;
+bool morseSolved = false;
+int currentWord = 0;
+int currentSymbol = 0;
+unsigned long morseLastChange = 0;
+bool morseLedOn = false;
+bool inWordPause = false;
+int dotTime = 200;
+int dashTime = 600;
+int pauseTime = 200;
+int wordPause = 2000;
+const char* morseWords[4] = {"-...", "--.", ".-.", "--."};
+
+const int BTN_CONFIRM = A13;
+const int GREEN_LED_PIN = A9;
+const int GREEN_LED_MORSE = A8;
+
+const char options0[] = {'Z','T','W','K','G'};
+const char options1[] = {'O','A','Q','R','C','I'};
+const char options2[] = {'Y','E','O','U','I','A'};
+const char options3[] = {'Q','D','L','W','P','S'};
+const int OPTIONS0_LEN = sizeof(options0);
+const int OPTIONS1_LEN = sizeof(options1);
+const int OPTIONS2_LEN = sizeof(options2);
+const int OPTIONS3_LEN = sizeof(options3);
+int optIndex[4] = {0,0,0,0};
+int cursorPos = 0;
+const char targetWord[5] = "WIEL";
+bool wordSolved = false;
+
+const uint8_t font[26][8] PROGMEM = {
+{0x00,0x18,0x24,0x24,0x3C,0x24,0x24,0x00},
+{0x00,0x3C,0x24,0x3C,0x24,0x24,0x3C,0x00},
+{0x00,0x1C,0x24,0x20,0x20,0x24,0x1C,0x00},
+{0x00,0x38,0x24,0x24,0x24,0x24,0x38,0x00},
+{0x00,0x3C,0x20,0x38,0x20,0x20,0x3C,0x00},
+{0x00,0x3C,0x20,0x38,0x20,0x20,0x20,0x00},
+{0x00,0x1C,0x20,0x20,0x2C,0x24,0x1C,0x00},
+{0x00,0x24,0x24,0x3C,0x24,0x24,0x24,0x00},
+{0x00,0x1C,0x08,0x08,0x08,0x08,0x1C,0x00},
+{0x00,0x0E,0x04,0x04,0x04,0x24,0x18,0x00},
+{0x00,0x24,0x28,0x30,0x28,0x24,0x24,0x00},
+{0x00,0x20,0x20,0x20,0x20,0x20,0x3C,0x00},
+{0x00,0x22,0x36,0x2A,0x22,0x22,0x22,0x00},
+{0x00,0x24,0x34,0x2C,0x2C,0x24,0x24,0x00},
+{0x00,0x18,0x24,0x24,0x24,0x24,0x18,0x00},
+{0x00,0x3C,0x24,0x24,0x3C,0x20,0x20,0x00},
+{0x00,0x18,0x24,0x24,0x24,0x2C,0x1A,0x00},
+{0x00,0x3C,0x24,0x24,0x3C,0x28,0x24,0x00},
+{0x00,0x1C,0x20,0x18,0x04,0x24,0x18,0x00},
+{0x00,0x3E,0x08,0x08,0x08,0x08,0x08,0x00},
+{0x00,0x24,0x24,0x24,0x24,0x24,0x18,0x00},
+{0x00,0x22,0x22,0x22,0x22,0x14,0x08,0x00},
+{0x00,0x22,0x22,0x2A,0x2A,0x36,0x22,0x00},
+{0x00,0x22,0x14,0x08,0x08,0x14,0x22,0x00},
+{0x00,0x22,0x14,0x08,0x08,0x08,0x08,0x00},
+{0x00,0x3C,0x04,0x08,0x10,0x20,0x3C,0x00}
+};
+
+uint8_t reverseBits(uint8_t b) {
+  b = (b & 0xF0) >> 4 | (b & 0x0F) << 4;
+  b = (b & 0xCC) >> 2 | (b & 0x33) << 2;
+  b = (b & 0xAA) >> 1 | (b & 0x55) << 1;
+  return b;
+}
+
+void drawChar(int dev, char c, bool highlight) {
+  for (int r = 0; r < 8; r++) {
+    uint8_t row = 0;
+    if (c >= 'A' && c <= 'Z') row = pgm_read_byte(&(font[c - 'A'][r]));
+    if (rotateMatrix180) lc.setRow(dev, 7 - r, reverseBits(row));
+    else lc.setRow(dev, r, row);
+  }
+  if (highlight) lc.setRow(dev, rotateMatrix180 ? 0 : 7, 0xFF);
+}
+
+void drawSolvedBorder() {
+  for (int dev = 0; dev < NUM_DEVICES; dev++) {
+    for (int row = 0; row < 8; row++) {
+      uint8_t line = (row == 0 || row == 7) ? 0xFF : 0x81;
+      if (rotateMatrix180) lc.setRow(dev, 7 - row, reverseBits(line));
+      else lc.setRow(dev, row, line);
+    }
+  }
+}
+
+void displayWord() {
+  if (wordSolved) return;
+  drawChar(0, options0[optIndex[0]], cursorPos == 0);
+  drawChar(1, options1[optIndex[1]], cursorPos == 1);
+  drawChar(2, options2[optIndex[2]], cursorPos == 2);
+  drawChar(3, options3[optIndex[3]], cursorPos == 3);
+}
+
+int readJoystick() {
+  int x = analogRead(JOY_X);
+  int y = analogRead(JOY_Y);
+  int dx = x - JOY_CENTER_X;
+  int dy = y - JOY_CENTER_Y;
+
+  if (abs(dx) < DEADZONE && abs(dy) < DEADZONE) {
+    axisLock = AXIS_NONE;
+    return JOY_NONE;
+  }
+
+  if (axisLock == AXIS_NONE) {
+    if (abs(dx) > abs(dy)) axisLock = AXIS_HORIZONTAL;
+    else axisLock = AXIS_VERTICAL;
+  }
+
+  if (axisLock == AXIS_HORIZONTAL) {
+    if (dx > DEADZONE) return JOY_RIGHT;
+    if (dx < -DEADZONE) return JOY_LEFT;
+  }
+
+  if (axisLock == AXIS_VERTICAL) {
+    if (dy > DEADZONE) return JOY_DOWN;
+    if (dy < -DEADZONE) return JOY_UP;
+  }
+
+  return JOY_NONE;
+}
+
+void changeLetter(int dir) {
+  int* idx = &optIndex[cursorPos];
+  int maxLen = (cursorPos == 0) ? OPTIONS0_LEN : (cursorPos == 1) ? OPTIONS1_LEN : (cursorPos == 2) ? OPTIONS2_LEN : OPTIONS3_LEN;
+  *idx = (*idx + dir + maxLen) % maxLen;
+}
+
+void handleJoystick() {
+  if (wordSolved) return;
+  if (millis() - lastJoyTime < JOY_DELAY) return;
+
+  int dir = readJoystick();
+  if (dir == lastDir || dir == JOY_NONE) {
+    lastDir = dir;
+    return;
+  }
+
+  lastDir = dir;
+  lastJoyTime = millis();
+
+  if (dir == JOY_LEFT) cursorPos = (cursorPos + 3) % 4;
+  else if (dir == JOY_RIGHT) cursorPos = (cursorPos + 1) % 4;
+  else if (dir == JOY_UP) changeLetter(1);
+  else if (dir == JOY_DOWN) changeLetter(-1);
+
+  displayWord();
+}
+
+void registerInput(int button) {
+  if (morseSolved) return;
+
+  userSequence[morseBufPos] = button;
+  morseBufPos = (morseBufPos + 1) % 4;
+  if (morseTotal < 4) morseTotal++;
+
+  if (morseTotal == 4) {
+    bool match = true;
+    for (int i = 0; i < 4; i++) {
+      int idx = (morseBufPos + i) % 4;
+      if (userSequence[idx] != correctSequence[i]) { match = false; break; }
+    }
+
+    if (match) {
+      morseSolved = true;
+      for (int i = 0; i < 4; i++) digitalWrite(morseLeds[i], HIGH);
+      digitalWrite(GREEN_LED_MORSE, HIGH);
+      Serial.println("Morse solved!");
+    }
+  }
+}
+
+void playMorse() {
+  unsigned long t = millis();
+
+  if (inWordPause) {
+    if (t - morseLastChange >= wordPause) {
+      inWordPause = false;
+      currentWord = (currentWord + 1) % 4;
+      currentSymbol = 0;
+      morseLastChange = t;
+    }
+    return;
+  }
+
+  char s = morseWords[currentWord][currentSymbol];
+  if (s == '\0') {
+    inWordPause = true;
+    morseLastChange = t;
+    return;
+  }
+
+  int duration = (s == '.') ? dotTime : dashTime;
+
+  if (!morseLedOn && t - morseLastChange >= pauseTime) {
+    digitalWrite(morseLeds[currentWord], HIGH);
+    morseLedOn = true;
+    morseLastChange = t;
+  }
+
+  if (morseLedOn && t - morseLastChange >= duration) {
+    digitalWrite(morseLeds[currentWord], LOW);
+    morseLedOn = false;
+    morseLastChange = t;
+    currentSymbol++;
+  }
+}
+
+void updateMorseButtons() {
+  static int lastState[4] = {HIGH,HIGH,HIGH,HIGH};
+  static unsigned long lastChange[4] = {0,0,0,0};
+  static bool latched[4] = {false,false,false,false};
+
+  unsigned long now = millis();
+  for (int i = 0; i < 4; i++) {
+    int s = digitalRead(morseButtons[i]);
+    if (s != lastState[i]) {
+      lastState[i] = s;
+      lastChange[i] = now;
+    } else {
+      if (s == LOW && !latched[i] && (now - lastChange[i] >= 25)) {
+        latched[i] = true;
+        registerInput(i + 1);
+      } else if (s == HIGH) {
+        latched[i] = false;
+      }
+    }
+  }
+}
+
+void updateConfirmButton() {
+  static int lastState = HIGH;
+  static unsigned long lastChange = 0;
+  static bool latched = false;
+
+  unsigned long now = millis();
+  int s = digitalRead(BTN_CONFIRM);
+
+  if (s != lastState) {
+    lastState = s;
+    lastChange = now;
+  } else {
+    if (s == LOW && !latched && (now - lastChange >= 35)) {
+      latched = true;
+      if (!wordSolved) {
+        char chosen[5];
+        chosen[0] = options0[optIndex[0]];
+        chosen[1] = options1[optIndex[1]];
+        chosen[2] = options2[optIndex[2]];
+        chosen[3] = options3[optIndex[3]];
+        chosen[4] = '\0';
+
+        if (strcmp(chosen, targetWord) == 0) {
+          wordSolved = true;
+          digitalWrite(GREEN_LED_PIN, HIGH);
+          drawSolvedBorder();
+          Serial.println("Correct!");
+        }
+      }
+    } else if (s == HIGH) {
+      latched = false;
+    }
+  }
+}
+
+void initMatrixJoystickMorseWord() {
+  for (int i = 0; i < 4; i++) {
+    pinMode(morseLeds[i], OUTPUT);
+    pinMode(morseButtons[i], INPUT_PULLUP);
+  }
+
+  pinMode(BTN_CONFIRM, INPUT_PULLUP);
+  pinMode(GREEN_LED_PIN, OUTPUT);
+  pinMode(GREEN_LED_MORSE, OUTPUT);
+
+  for (int i = 0; i < NUM_DEVICES; i++) {
+    lc.shutdown(i, false);
+    lc.setIntensity(i, 4);
+    lc.clearDisplay(i);
+  }
+
+  displayWord();
+}
+
+void pollMatrixJoystickMorseWord() {
+  updateMorseButtons();
+  if (!morseSolved) playMorse();
+  if (!wordSolved) handleJoystick();
+  updateConfirmButton();
+}
+
+/* ===================== Setup / loop ===================== */
+
+void setup() {
+  Serial.begin(115200);
+  unsigned long start = millis();
+  while (!Serial && (millis() - start < 1500)) {}
+
+  initPairSimon();
+  initEncoderPuzzle();
+  initMatrixJoystickMorseWord();
+
+  Serial.println("All subsystems initialized.");
+}
+
+void loop() {
+  updateBuzzer();
+  pollPairSimon();
+  pollEncoderPuzzle();
+  pollMatrixJoystickMorseWord();
+}
